@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>M4A → MP3 Converter</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body {
+    font: 16px/1.5 system-ui, -apple-system, sans-serif;
+    max-width: 640px; margin: 40px auto; padding: 0 20px;
+  }
+  h1 { font-size: 1.4rem; margin-bottom: .25rem; }
+  .sub { opacity: .7; margin-top: 0; }
+  #drop {
+    border: 2px dashed #888; border-radius: 12px; padding: 40px 20px;
+    text-align: center; cursor: pointer; transition: background .15s, border-color .15s;
+  }
+  #drop.over { border-color: #2a7; background: rgba(34,170,119,.08); }
+  #drop input { display: none; }
+  .row { display: flex; gap: 12px; align-items: center; margin: 16px 0; flex-wrap: wrap; }
+  button {
+    font: inherit; padding: 8px 16px; border-radius: 8px; border: 1px solid #888;
+    background: #2a7; color: #fff; cursor: pointer;
+  }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  select { font: inherit; padding: 6px 8px; border-radius: 8px; }
+  #log {
+    white-space: pre-wrap; font: 13px/1.4 ui-monospace, monospace;
+    background: rgba(128,128,128,.12); border-radius: 8px; padding: 12px;
+    margin-top: 16px; max-height: 240px; overflow: auto;
+  }
+  #results a { display: block; margin: 6px 0; }
+</style>
+</head>
+<body>
+  <h1>M4A → MP3 Converter</h1>
+  <p class="sub">Runs entirely in your browser. Files never leave your computer.</p>
+
+  <label id="drop">
+    <input type="file" id="file" accept=".m4a,audio/m4a,audio/x-m4a,audio/mp4" multiple />
+    <div><strong>Drop .m4a files here</strong> or click to choose</div>
+  </label>
+
+  <div class="row">
+    <label>Bitrate:
+      <select id="bitrate">
+        <option value="128k">128 kbps</option>
+        <option value="192k" selected>192 kbps</option>
+        <option value="256k">256 kbps</option>
+        <option value="320k">320 kbps</option>
+      </select>
+    </label>
+    <button id="go" disabled>Convert</button>
+    <span id="status"></span>
+  </div>
+
+  <div id="results"></div>
+  <div id="log" hidden></div>
+
+<!-- ffmpeg.wasm engine, served locally from ./vendor (no CDN, no cross-origin) -->
+<script src="./vendor/ffmpeg.js"></script>
+<script>
+const $ = (id) => document.getElementById(id);
+const drop = $('drop'), fileInput = $('file'), go = $('go');
+const statusEl = $('status'), logEl = $('log'), results = $('results');
+
+let files = [];
+let ffmpeg = null;
+
+function log(msg) {
+  logEl.hidden = false;
+  logEl.textContent += msg + '\n';
+  logEl.scrollTop = logEl.scrollHeight;
+}
+function setStatus(s) { statusEl.textContent = s; }
+
+// fetchFile: read a File/Blob into the byte array ffmpeg expects.
+async function fetchFile(file) {
+  return new Uint8Array(await file.arrayBuffer());
+}
+
+// ── File selection (click + drag/drop) ──────────────────────────────────────
+function accept(list) {
+  files = [...list].filter(f => /\.m4a$/i.test(f.name) || /mp4|m4a/.test(f.type));
+  go.disabled = files.length === 0;
+  setStatus(files.length ? `${files.length} file(s) ready` : 'No .m4a files selected');
+}
+fileInput.addEventListener('change', () => accept(fileInput.files));
+['dragenter','dragover'].forEach(e =>
+  drop.addEventListener(e, ev => { ev.preventDefault(); drop.classList.add('over'); }));
+['dragleave','drop'].forEach(e =>
+  drop.addEventListener(e, ev => { ev.preventDefault(); drop.classList.remove('over'); }));
+drop.addEventListener('drop', ev => accept(ev.dataTransfer.files));
+
+// ── Load ffmpeg.wasm once, on demand (all local files) ──────────────────────
+async function loadFFmpeg() {
+  if (ffmpeg) return ffmpeg;
+  if (!window.FFmpegWASM) throw new Error('ffmpeg engine script failed to load from ./vendor/ffmpeg.js');
+  setStatus('Loading converter (first time only, ~30 MB)…');
+  const { FFmpeg } = window.FFmpegWASM;
+  ffmpeg = new FFmpeg();
+  ffmpeg.on('log', ({ message }) => log(message));
+  // Must be ABSOLUTE URLs. The engine resolves a relative classWorkerURL against
+  // a path baked in at build time (file:///home/jeromewu/...), not against this
+  // page — so a relative path produces a broken file:// worker URL. Build the
+  // absolute URL from the current page location instead.
+  const abs = (p) => new URL(p, window.location.href).href;
+  await ffmpeg.load({
+    classWorkerURL: abs('./vendor/814.ffmpeg.js'),
+    coreURL: abs('./vendor/ffmpeg-core.js'),
+    wasmURL: abs('./vendor/ffmpeg-core.wasm'),
+  });
+  return ffmpeg;
+}
+
+// ── Convert ──────────────────────────────────────────────────────────────────
+go.addEventListener('click', async () => {
+  go.disabled = true;
+  results.innerHTML = '';
+  logEl.textContent = '';
+  const bitrate = $('bitrate').value;
+
+  try {
+    const ff = await loadFFmpeg();
+    for (let i = 0; i < files.length; i++) {
+      const f = files[i];
+      const stem = f.name.replace(/\.m4a$/i, '');
+      const inName = `in_${i}.m4a`, outName = `${stem}.mp3`;
+      setStatus(`Converting ${i + 1}/${files.length}: ${f.name}`);
+
+      await ff.writeFile(inName, await fetchFile(f));
+      await ff.exec(['-i', inName, '-codec:a', 'libmp3lame',
+                     '-b:a', bitrate, '-map_metadata', '0', outName]);
+      const data = await ff.readFile(outName);
+
+      const url = URL.createObjectURL(new Blob([data.buffer], { type: 'audio/mpeg' }));
+      const a = document.createElement('a');
+      a.href = url; a.download = outName; a.textContent = `⬇ ${outName}`;
+      results.appendChild(a);
+
+      await ff.deleteFile(inName);
+      await ff.deleteFile(outName);
+    }
+    setStatus(`Done — ${files.length} file(s) converted. Click the links above to save.`);
+  } catch (err) {
+    setStatus('Error — see log below.');
+    log('ERROR: ' + (err?.message || err));
+  } finally {
+    go.disabled = files.length === 0;
+  }
+});
+</script>
+</body>
+</html>

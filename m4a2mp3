@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+#
+# m4a2mp3 — convert M4A audio files to MP3 using ffmpeg.
+#
+# Usage:
+#   m4a2mp3 [options] <file-or-dir> [more files/dirs...]
+#
+# Examples:
+#   m4a2mp3 song.m4a                 # -> song.mp3 (next to the original)
+#   m4a2mp3 ~/Music/podcasts         # convert every .m4a in that folder
+#   m4a2mp3 -b 320k a.m4a b.m4a      # higher bitrate
+#   m4a2mp3 -o ./out -r ~/Music      # recurse, write all mp3s into ./out
+#   m4a2mp3 -f song.m4a              # overwrite existing song.mp3
+#
+# Options:
+#   -b, --bitrate RATE   MP3 bitrate (default: 192k). e.g. 128k, 256k, 320k
+#   -o, --outdir DIR     Write .mp3 files here (default: alongside each source)
+#   -r, --recursive      Recurse into subdirectories when given a folder
+#   -f, --force          Overwrite an existing .mp3 instead of skipping it
+#   -q, --quiet          Less output
+#   -h, --help           Show this help
+
+set -euo pipefail
+
+BITRATE="192k"
+OUTDIR=""
+RECURSIVE=0
+FORCE=0
+QUIET=0
+
+prog=$(basename "$0")
+
+err()  { printf '%s: %s\n' "$prog" "$*" >&2; }
+log()  { [ "$QUIET" -eq 1 ] || printf '%s\n' "$*"; }
+usage() { sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; }
+
+# ── Parse arguments ──────────────────────────────────────────────────────────
+INPUTS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -b|--bitrate)   BITRATE="${2:?missing value for $1}"; shift 2 ;;
+    -o|--outdir)    OUTDIR="${2:?missing value for $1}"; shift 2 ;;
+    -r|--recursive) RECURSIVE=1; shift ;;
+    -f|--force)     FORCE=1; shift ;;
+    -q|--quiet)     QUIET=1; shift ;;
+    -h|--help)      usage; exit 0 ;;
+    --)             shift; while [ $# -gt 0 ]; do INPUTS+=("$1"); shift; done ;;
+    -*)             err "unknown option: $1"; usage >&2; exit 2 ;;
+    *)              INPUTS+=("$1"); shift ;;
+  esac
+done
+
+# ── Preconditions ────────────────────────────────────────────────────────────
+if ! command -v ffmpeg >/dev/null 2>&1; then
+  err "ffmpeg is not installed. Install it with:  brew install ffmpeg"
+  exit 1
+fi
+
+if [ "${#INPUTS[@]}" -eq 0 ]; then
+  err "no input files or directories given."
+  usage >&2
+  exit 2
+fi
+
+if [ -n "$OUTDIR" ]; then
+  mkdir -p "$OUTDIR"
+fi
+
+# ── Collect the list of .m4a files to convert ────────────────────────────────
+FILES=()
+for input in "${INPUTS[@]}"; do
+  if [ -d "$input" ]; then
+    if [ "$RECURSIVE" -eq 1 ]; then
+      while IFS= read -r -d '' f; do FILES+=("$f"); done \
+        < <(find "$input" -type f -iname '*.m4a' -print0)
+    else
+      while IFS= read -r -d '' f; do FILES+=("$f"); done \
+        < <(find "$input" -maxdepth 1 -type f -iname '*.m4a' -print0)
+    fi
+  elif [ -f "$input" ]; then
+    case "$input" in
+      *.m4a|*.M4A) FILES+=("$input") ;;
+      *) err "skipping (not an .m4a file): $input" ;;
+    esac
+  else
+    err "no such file or directory: $input"
+  fi
+done
+
+if [ "${#FILES[@]}" -eq 0 ]; then
+  err "found no .m4a files to convert."
+  exit 1
+fi
+
+# ── Convert ──────────────────────────────────────────────────────────────────
+converted=0
+skipped=0
+failed=0
+
+for src in "${FILES[@]}"; do
+  base=$(basename "$src")
+  stem="${base%.*}"
+  if [ -n "$OUTDIR" ]; then
+    dst="$OUTDIR/$stem.mp3"
+  else
+    dst="$(dirname "$src")/$stem.mp3"
+  fi
+
+  if [ -e "$dst" ] && [ "$FORCE" -ne 1 ]; then
+    log "skip   $base  (mp3 exists; use -f to overwrite)"
+    skipped=$((skipped + 1))
+    continue
+  fi
+
+  log "convert $base  ->  $(basename "$dst")  @ $BITRATE"
+  # -map_metadata 0 keeps title/artist/album tags; -id3v2_version 3 for wide compatibility.
+  if ffmpeg -hide_banner -loglevel error -y \
+        -i "$src" \
+        -codec:a libmp3lame -b:a "$BITRATE" \
+        -map_metadata 0 -id3v2_version 3 \
+        "$dst" </dev/null; then
+    converted=$((converted + 1))
+  else
+    err "failed to convert: $src"
+    failed=$((failed + 1))
+  fi
+done
+
+log ""
+log "done: $converted converted, $skipped skipped, $failed failed"
+[ "$failed" -eq 0 ] || exit 1
